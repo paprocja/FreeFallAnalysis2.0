@@ -1,0 +1,472 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy import integrate
+from datetime import datetime
+from Data.QSBCLine import QSBCLine
+from Utils.DateFolder import get_date_folder
+
+# Represents a peak where the penetrometer has hit the ground
+class Peak:
+    #peak_center is the x cordinate of the center of the peak
+    #BD is a bd_data object that the peak is within
+    def __init__(self, peak_num, penetrometer_data):
+        """
+        Constructor for Peak object
+
+        Parameters
+        ----------
+        peak_center: int
+            x value of the highest point of the peak
+        penetrometer_data: PenetrometerData
+            data object from which the peak comes from
+
+        Assigns
+        -------
+        self.peak_center: int
+            y-value or max height of peak
+        self.start: int
+            x-value for start of peak within penetrometer_data object
+        self.end: int
+            x-value for end of peak within penetrometer_data object
+
+        self.data, self.g250g, self.g200g, self.g50g, self.g18g, self.g2g:
+            Cut copies of accelerometer/raw data of peak from penetrometer_data
+        """
+        # set file path according to caller
+        if penetrometer_data.is_main:
+            self.log_directory = '../saved_data/'
+        else:
+            self.log_directory = '../../saved_data/'
+
+        # grabs max height of peak
+        self.peak_center = penetrometer_data.peaks[peak_num]
+        self.offset = 0
+        
+        # determines bounds of peak to copy data from
+        if self.peak_center <= 1500:
+            # Peak is at the beginning of the file
+            self.start = 0
+            self.end = self.peak_center + 500
+        elif self.peak_center > penetrometer_data.data.shape[0]-500: # previously > 119500
+            # Peak is close to the end of file
+            self.start = self.peak_center - 1500
+            self.end = penetrometer_data.data.size
+        else:
+            # Peak is in the middle of file
+            self.start = self.peak_center - 1500
+            self.end = self.peak_center + 500
+        # performs all calculations available at time of creation
+        self._copy_from_penetrometer_data(penetrometer_data)    
+        self._set_peak(penetrometer_data)
+        self._find_end_of_drop()
+
+        # defines values to be used later for potential storage / saving objects
+        self.deceleration = None
+        self.deceleration_ms2 = None
+        self.velocity = None
+        self.depth = None
+        self.selected_spike = None
+        self.area = None
+        self.initial_qsbc_for_K = None
+
+    def calculate_QSBC_for_K(self, correction_type, correction_factor, tip_type, in_water=False):
+            """
+            Calculates standardized quasi static bearing capacity based on type, factor, and tip.
+
+            Parameters
+            ----------
+            correction_type: int
+                the type of correction either Log, Asinh, Beta
+            correction_factor: float
+                either the k or beta value to be used in calculation
+            tip_type: char
+                the type of tip the penetrometer has
+            in_water: bool
+                indicates if the drop was perfomed in water or in air
+
+            Return
+            ------
+            numpy array
+                the corrected qsbc for a given correction type, factor, and tip
+            """
+            BUOYANCY = 1020*0.002473
+
+            mass, _ = self._get_mass_length(tip_type)
+
+            # If the drop was performed in water the mass needs to be adjusted due to buoyancy
+            if in_water:  
+                mass = mass - BUOYANCY
+
+            # Take off the last value because it is 0 and we cannot take log of 0
+            corrected_velocity = self.velocity[:-1] / 0.02
+
+            # Calculate fsr
+            if correction_type == 1:
+                # Logarithmic
+                fsr = np.array([1 + correction_factor * math.log10(v) for v in corrected_velocity])
+            elif correction_type == 2:
+                # Asinh
+                k_prime = correction_factor / math.log(10)
+                fsr = np.array([1 + k_prime * math.asinh(v) for v in corrected_velocity])
+            else:
+                # Beta
+                fsr = np.array([v ** correction_factor for v in corrected_velocity])
+
+            force_bouyancy = self.deceleration * mass * 9.81
+
+            # the first value in the area array is 0
+            q_dynamic = force_bouyancy[1:] / self.area[1:]
+            self.qdyn = q_dynamic
+
+            # get average qdyn
+            # this code is overly complex because of how this is structured, but basically it finds the average Qdyn over intervals of depth (every 1 cm)
+            # it then replaces all values of Qdyn with these averages and also makes a similar array for the midpoints of all depths
+            bins = (self.depth[1:] // 0.01).astype(int)
+            ave_q_dyn = np.zeros_like(q_dynamic, dtype=float)
+            depth_mid = np.zeros_like(self.depth[1:], dtype=float)
+            for bin_id in np.unique(bins):
+                mask = bins == bin_id
+                ave_q_dyn[mask] = q_dynamic[mask].mean()
+                depth_mid[mask] = (bin_id + 0.5) * 0.01
+            self.averaged_qdyn = ave_q_dyn
+            self.depth_midpoints = depth_mid
+
+            # because we adjusted q_dynamic and velocity we need to correct here to allign the values
+            qsbc =  q_dynamic[:-1] / fsr[1:]
+
+            qsbc_kPa = qsbc / 1000
+
+            return qsbc_kPa
+        
+    def integrate_spike(self, spike):
+        """
+        Gets velocity and depth for a spike and calculates the area of the penetrometer
+        """
+        self._integrate_acceleration(spike)
+        self._calculate_area_of_meter()
+
+    # TODO get the start and end k values to pass into calculate average from the user
+    def calculate_corrected_qsbc(self, correction_type, peak_start, peak_end, in_water):
+        """
+        Calculates the corrected qsbc based on defined factors
+        """
+        # Calculate different lines depending on the correction type
+        if correction_type != 3:
+            line1_start_k = 1.0
+            line1_end_k = 1.5
+            line2_start_k = 0.2
+            line2_end_k = 0.4
+            line1 = self._calculate_average_qsbc(correction_type, line1_start_k, line1_end_k, peak_start, peak_end, in_water=in_water)
+            line2 = self._calculate_average_qsbc(correction_type, line2_start_k, line2_end_k, peak_start, peak_end, in_water=in_water)
+            self.corrected_qsbc_lines = [line1, line2]
+        else:
+            line1_start_k = 0.035
+            line1_end_k = 0.085
+            line1 = self._calculate_average_qsbc(correction_type, line1_start_k, line1_end_k, peak_start, peak_end, in_water=in_water)
+            self.corrected_qsbc_lines = [line1]
+        return self.corrected_qsbc_lines
+    
+    def calculate_corrected_qsbc_given_k(self, correction_type, peak_start, peak_end, in_water, k_value):
+        """
+        Calculates the corrected qsbc based on defined factors
+        """
+    
+        line = self._calculate_average_qsbc(correction_type, k_value, k_value, peak_start, peak_end, in_water=in_water)
+        return line
+
+    def _copy_from_penetrometer_data(self, penetrometer_data):
+        """
+        copies data from the penetrometer_data object
+        """
+        self.data = penetrometer_data.data[self.start:self.end+1].copy()
+        self.g250g = penetrometer_data.g250g[self.start:self.end+1].copy()
+        self.g200g = penetrometer_data.g200g[self.start:self.end+1].copy()
+        self.g50g = penetrometer_data.g50g[self.start:self.end+1].copy()
+        self.g50g_whole = penetrometer_data.g50g.copy()
+        self.g18g = penetrometer_data.g18g[self.start:self.end+1].copy()
+        self.g2g = penetrometer_data.g2g[self.start:self.end+1].copy()
+        self.gX55g = penetrometer_data.gX55g[self.start:self.end+1].copy()
+        self.gY55g = penetrometer_data.gY55g[self.start:self.end+1].copy()
+        # Grabs the x,y values of the peak. 
+        # Offsets the x value to be in terms of the peak.
+        self.peak_height = penetrometer_data.g250g[self.peak_center]
+        self.peak_center = self.peak_center - self.start
+
+    def _set_peak(self, penetrometer_data):
+        """
+        Sets the peak that can be displayed and integrated.
+        A column (meter) from the matrix based off the magnitude of the peak, centers the column around 0
+
+        Parameters
+        ----------
+        penetrometer_data: PenetrometerData
+            The data the peak comes from
+        
+        Assigns
+        -------
+        self.peak: numpy array
+            an array of offset data for a specific meter over an interval
+        """
+
+        # Returns the max value in the 250g array within the interval
+        max_250 = np.max(self.g250g)
+
+        # Returns the max value in the 250g array within the interval
+        max_200 = np.max(self.g200g)
+
+        # Based on the max value of the peak determine which accelerometer to use for the peak
+        offset = None
+        if (max_250 > 200):
+            spliced_meter = self.g250g.copy()
+            meter_to_analyze = penetrometer_data.g250g.copy()
+        elif (max_200 > 50):
+            spliced_meter = self.g200g.copy()
+            meter_to_analyze = penetrometer_data.g200g.copy()
+        elif (max_200 > 18):
+            spliced_meter = self.g50g.copy()
+            meter_to_analyze = penetrometer_data.g50g.copy()
+            offset = np.mean(meter_to_analyze[self.end + 100:self.end + 201])
+        elif (max_200 > 1.7):
+            spliced_meter = self.g18g.copy()
+            meter_to_analyze = penetrometer_data.g18g.copy()
+        else:
+            spliced_meter = self.g2g.copy()
+            meter_to_analyze = penetrometer_data.g2g.copy()
+
+        # Stores the peak as an array offset for integration
+        if offset is None:
+            offset = self._get_meter_offset(meter_to_analyze) 
+
+        self.offset = offset
+        self.peak = spliced_meter - offset
+        
+    def _get_meter_offset(self, meter):
+        """
+        Gets the y-value offset for a particular meter.
+        The values need to be offset so the peak starts to increase around 0 for integration
+
+        Parameters
+        ----------
+        meter: numpy array
+            the numpy array which the offset will be calculated off of
+
+        Return
+        ------
+        float
+            the y offset for a specific meter's data and interval
+        """
+
+        if self.end + 2001 > len(meter):
+            # if at the end of the graph, return values before the interval
+            return np.mean(meter[self.start - 2000:self.start - 999])
+        return np.mean(meter[self.end + 1000:self.end + 2001])
+    
+    def _get_mass_length(self, tip_type):
+        """
+        Gets the mass and length of a meter given a specific tip type.
+
+        Parameters
+        ----------
+        tip_type: char
+            the tip type to get the mass and length for 
+
+        Return
+        ------
+        float:
+            the mass of a meter
+        float:
+            the length of a meter
+        """
+        if tip_type == 'b':            
+            return 10.30, 8.57
+        elif tip_type ==  'e':
+            return 9.15, 8.26
+        else : 
+            return 7.71, 7.87
+    
+    def get_decel_velo_depth_at_max_decel(self):
+        max_decel_index = 0
+        max_decel = min(self.deceleration)
+        for i in range(0, len(self.deceleration)):
+            if self.deceleration[i] > max_decel:
+                max_decel = self.deceleration[i]
+                max_decel_index = i
+
+        return self.deceleration[max_decel_index], self.velocity[max_decel_index], self.depth[max_decel_index]
+
+    def _find_end_of_drop(self):
+        """
+        Need see if this code can be cleaned up. Right now this is just the
+        same functinoality that the matlab script had for `findent2`. 
+        Not sure if its accounting for some edge case but seems extra, looks like
+        we could just use num1? We're looping from peak to end of it, so its only 
+        going down?
+        """
+        for i in range(self.peak_center, len(self.peak)):
+            if self.peak[i] <= 0:
+                num1 = i
+                num2 = i-1
+                break
+        self.end_of_drop = num1 if abs(self.peak[num1]) < abs(self.peak[num2]) else num2
+
+    def _integrate_acceleration(self, selected_spike):
+        """
+        Uses accelerometer data and selection of the spike to integrate for velocity and depth
+
+        Parameters
+        ----------
+        selected_spike: int
+            x value for start of peak from graph
+
+        """
+        # splices deceleration from peak_center to end_of_drop in peak
+        decel = np.array(self.peak[selected_spike:self.end_of_drop + 1]) # +1 for inclusion (difference in MATLAB)
+        self.deceleration = decel
+        self.deceleration_ms2 = decel * 9.81
+
+        # integrates deceleration over time (.0005 seconds per record) for velocity
+        vel = integrate.cumulative_trapezoid(self.deceleration_ms2, dx=.0005, initial=0)
+
+        # TODO from matlab script: "find a better way to do this, vel should be near 0" in reference to the next 2 lines
+        max_vel = np.max(vel)
+        vel_corrected = max_vel - vel
+        self.velocity = vel_corrected
+
+        # integrates velocity over time for depth
+        self.depth = integrate.cumulative_trapezoid(self.velocity, dx=.0005, initial=0)
+    
+    def _calculate_average_qsbc(self, correction_type, start_k, end_k, start_range, end_range, tip_type = 'c', in_water=False):
+        """
+        Returns the average QSBC between two given strain-rate factors
+
+        Parameters
+        ----------
+        correction_type: int
+            the type of correction either Log, Asinh, Beta
+        start_k: float
+            the lower k value for the averaged range
+        end_k: float
+            the higher k value for the averaged range
+        start_range: integer
+            starting value of array to be used in calculation
+        end_range: integer
+            ending value of array to be used in calculation
+        tip_type: char
+            the type of tip the penetrometer has
+        in_water: bool
+            indicates if the drop was performed in water
+
+        Return
+        ------
+        numpy array
+            the average qsbc between the two given strain-rate factors
+        """
+        # Calculates lower bound array
+        val1 = self.calculate_QSBC_for_K(correction_type, start_k, tip_type, in_water)
+        # Calculates higher bound array
+        val2 = self.calculate_QSBC_for_K(correction_type, end_k, tip_type, in_water)
+
+        # Cuts off unneeded values
+        val1r = val1[start_range - 2:end_range - 1]
+        val2r = val2[start_range - 2:end_range - 1]
+
+        #Finds average between arrays
+        ave = (val1r + val2r) / 2
+
+        self.save_corrections(ave, val1r, val2r, start_k, end_k, correction_type)
+
+        #Save the strain rate values with strain type and k-value in title
+        qsbc_line = QSBCLine(val1r, val2r, ave)
+        return qsbc_line
+        
+    def _calculate_area_of_meter(self, tip_type='c', a_type='p'):
+        """
+        Calculates the array of a penetrometer at each step.
+
+        Parameters
+        ----------
+        tip_type: str 
+            Type of the tip ('c', 'b', or 'p')
+        a_type: str 
+            Area type ('m' or 'p')
+        """
+
+        _, length = self._get_mass_length(tip_type)
+        
+        depth_cm = np.array(self.depth) * 100  # Convert depth to cm
+        A1 = np.zeros(len(depth_cm))
+        r = np.zeros(len(depth_cm))
+        
+        for k in range(len(depth_cm)):
+            if tip_type == 'c':
+                if a_type == 'm':
+                    if depth_cm[k] < length:
+                        r[k] = depth_cm[k] * np.tan(np.radians(30))
+                        A1[k] = np.pi * r[k] * (np.sqrt((r[k]**2) + (depth_cm[k]**2)))
+                    else:
+                        r[k] = 4.375
+                        A1[k] = np.pi * r[k] * (np.sqrt((r[k]**2) + (length**2)))
+                elif a_type == 'p':
+                    if depth_cm[k] < length:
+                        r[k] = depth_cm[k] * np.tan(np.radians(30))
+                        A1[k] = np.pi * r[k]**2
+                    else:
+                        r[k] = 4.375
+                        A1[k] = np.pi * r[k]**2
+            
+            elif tip_type == 'b':
+                if a_type == 'm':
+                    r[k] = 4.375
+                    if depth_cm[k] < length:
+                        A1[k] = np.pi * r[k]**2 + 2 * np.pi * r[k] * depth_cm[k]
+                    else:
+                        A1[k] = np.pi * r[k]**2 + 2 * np.pi * r[k] * length
+                elif a_type == 'p':
+                    A1[k] = np.pi * 4.375**2
+            
+            elif tip_type == 'p':
+                if a_type == 'm':
+                    if depth_cm[k] < length:
+                        r[k] = np.sqrt(2.4184 * depth_cm[k])
+                    else:
+                        r[k] = 4.375
+                    
+                    polarfun = lambda theta, r: r * np.sqrt(0.745 * r**2 + 1)
+                    A1[k], _ = integrate.dblquad(polarfun, 0, 2 * np.pi, lambda _: 0, lambda _: r[k])
+                
+                elif a_type == 'p':
+                    if depth_cm[k] < length:
+                        r[k] = np.sqrt(2.4184 * depth_cm[k])
+                        A1[k] = np.pi * r[k]**2
+                    else:
+                        r[k] = 4.375
+                        A1[k] = np.pi * r[k]**2
+            
+            A1[k] = A1[k] / 10000  # Convert area to square meters
+        
+        self.area = A1
+        self.save_area()
+
+    def save_area(self):
+        df = pd.DataFrame({"Area (m^2)": self.area})
+        filename = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        df.to_csv(f'{self.log_directory}{get_date_folder()}/' + 'area_data_' + filename + '.csv', index=False)
+
+    def save_corrections(self, ave, start_correction, end_correction, start_k, end_k, correction_type):
+        if correction_type == 1:
+            # Logarithmic
+            df = pd.DataFrame({"Log Correction: " + str(start_k): start_correction, "Log Correction: " + str(end_k): end_correction, "Log Correction Average": ave})
+            filename = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            df.to_csv(f'{self.log_directory}{get_date_folder()}/' + 'log_correction_' + str(start_k) + '-to-' + str(end_k) + '_' + filename + '.csv', index=False)
+        elif correction_type == 2:
+            # Asinh
+            df = pd.DataFrame({"Asinh Correction: " + str(start_k): start_correction, "Asinh Correction: " + str(end_k): end_correction, "Asinh Correction Average": ave})
+            filename = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            df.to_csv(f'{self.log_directory}{get_date_folder()}/' + 'asinh_correction_' + str(start_k) + '-to-' + str(end_k) + '_' + filename + '.csv', index=False)
+        else:
+            # Beta
+            df = pd.DataFrame({"Beta Correction: " + str(start_k): start_correction, "Beta Correction: " + str(end_k): end_correction, "Beta Correction Average": ave})
+            filename = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            df.to_csv(f'{self.log_directory}{get_date_folder()}/' + 'beta_correction_' + str(start_k) + '-to-' + str(end_k) + '_' + filename + '.csv', index=False)

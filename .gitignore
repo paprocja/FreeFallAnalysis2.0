@@ -1,0 +1,14 @@
+# ignore environment configuration
+**/__pycache__/
+
+sponsor-docs/
+
+recordings/
+
+*.csv
+
+*.png
+
+*.DS_Store
+
+.venv
